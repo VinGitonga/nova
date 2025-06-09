@@ -12,6 +12,7 @@
   "type": "module",
   "devDependencies": {
     "@types/dotenv": "^8.2.3",
+    "@types/pouchdb": "^6.4.2",
     "typescript": "^5.8.3"
   },
   "dependencies": {
@@ -23,6 +24,7 @@
     "@langchain/openai": "^0.5.12",
     "@xmtp/node-sdk": "2.1.0",
     "dotenv": "^16.5.0",
+    "pouchdb": "^9.0.0",
     "uint8arrays": "^5.1.0",
     "zod": "^3.25.56"
   }
