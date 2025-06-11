@@ -1,4 +1,4 @@
-import { Coinbase, Wallet } from "@coinbase/coinbase-sdk";
+import { Address, Coinbase, Wallet } from "@coinbase/coinbase-sdk";
 import { CDP_API_KEY, CDP_API_KEY_PRIVATE_KEY, ENCRYPTION_KEY, NETWORK_ID, OPENAI_API_KEY, WALLET_KEY, XMTP_ENV } from "./constants";
 import { createSigner, getEncryptionKeyFromHex, logAgentDetails } from "@helpers/client";
 import { Client, Conversation, DecodedMessage, XmtpEnv } from "@xmtp/node-sdk";
@@ -7,13 +7,26 @@ import { AgentKit, AgentKitOptions, CdpWalletProvider, erc20ActionProvider, wall
 import { getLangChainTools } from "@coinbase/agentkit-langchain";
 import { END, MemorySaver, MessagesAnnotation, START, StateGraph } from "@langchain/langgraph";
 import { createReactAgent, ToolNode } from "@langchain/langgraph/prebuilt";
-import { askHumanTool, groupSavingsTool, investmentTool, lendingTool, votingTool } from "tools";
+import {
+	askHumanTool,
+	checkContributionBalanceTool,
+	checkGroupStatusTool,
+	checkLoanBalanceTool,
+	checkLoanEligibilityTool,
+	checkPaymentHistoryTool,
+	checkWalletAddressTool,
+	groupSavingsTool,
+	investmentTool,
+	lendingTool,
+	votingTool,
+} from "tools";
 import { convertToOpenAITool } from "@langchain/core/utils/function_calling";
 import { AIMessage, BaseMessage, HumanMessage } from "@langchain/core/messages";
 import { StructuredTool } from "@langchain/core/tools";
 import { ChatPromptTemplate, MessagesPlaceholder } from "@langchain/core/prompts";
 import { Runnable, RunnableConfig } from "@langchain/core/runnables";
 import * as fs from "fs";
+import { SYSTEM_PROMPT } from "constants/prompt";
 
 Coinbase.configure({ apiKeyName: CDP_API_KEY, privateKey: CDP_API_KEY_PRIVATE_KEY.replace(/\\n/g, "\n") });
 
@@ -24,32 +37,29 @@ type Agent = ReturnType<typeof createReactAgent>;
 interface AgentConfig {
 	configurable: {
 		thread_id: string;
+		walletAddress: string;
 	};
 }
 
 const memoryStore: Record<string, MemorySaver> = {};
 const agentStore: Record<string, { agent: Agent; config: AgentConfig }> = {};
-const chamaTools = [groupSavingsTool, lendingTool, votingTool, investmentTool, askHumanTool];
+const chamaTools = [
+	groupSavingsTool,
+	lendingTool,
+	votingTool,
+	investmentTool,
+	askHumanTool,
+	checkWalletAddressTool,
+	checkPaymentHistoryTool,
+	checkLoanBalanceTool,
+	checkGroupStatusTool,
+	checkLoanEligibilityTool,
+	checkContributionBalanceTool,
+];
 
 async function createAgent({ llm, tools, systemMessage }: { llm: ChatOpenAI; tools: StructuredTool[]; systemMessage: string }) {
 	const toolNames = tools.map((tool) => tool.name).join(", ");
-	let prompt = ChatPromptTemplate.fromMessages([
-		[
-			"system",
-			"You are a helpful AI assistant for the Chama DeFi project, managing a single savings pool for group-based financial activities on the Base Sepolia testnet (chain ID: 84532). " +
-				"The user's wallet address is provided in the message metadata as additional_kwargs.walletAddress (e.g., '0x123...'). ALWAYS use this walletAddress for tool calls unless the user explicitly provides a different one. " +
-				"Interpret natural language inputs to perform actions using the provided tools: deposit funds, request loans, vote on loans, propose investments, or check balances. " +
-				"For deposits, call groupSavingsTool with walletAddress and amount. For loan requests, call lendingTool with walletAddress, amount, collateral, and interestRate (0-20%). " +
-				"For voting on loans, call votingTool with walletAddress, loanId, and vote (true/false). For proposing investments, call investmentTool with walletAddress, description, amount, and action='propose'. " +
-				"If a tool response includes 'Please confirm' or 'requires confirmation', call askHuman to pause and request user input ('approve', 'reject', or 'adjust' with JSON, e.g., {{'amount': 500}}). " +
-				"If the input is ambiguous or missing required parameters (e.g., amount for deposits, collateral for loans), call askHuman to request clarification, including the walletAddress in the prompt for context. " +
-				"Respond conversationally to casual inputs (e.g., 'hi', 'hello') with a friendly clarification, suggesting actions like 'Want to deposit funds or check your balance? Try \"deposit 10\" or \"check balance\".' " +
-				'For informal or strong language, respond playfully but guide toward valid actions, e.g., \'Spicy vibes! 😎 Let’s do business—try "deposit 10" or "loan 100".\' ' +
-				"Maintain conversation context across messages to avoid redundant requests. Prefix final responses with 'FINAL ANSWER' when the action is complete and no further input is needed. " +
-				"Available tools: {tool_names}.\n{system_message}",
-		],
-		new MessagesPlaceholder("messages"),
-	]);
+	let prompt = ChatPromptTemplate.fromMessages([["system", SYSTEM_PROMPT], new MessagesPlaceholder("messages")]);
 
 	prompt = await prompt.partial({
 		system_message: systemMessage,
@@ -124,7 +134,14 @@ async function runAgentNode(props: { state: typeof MessagesAnnotation.State; age
 	};
 }
 
-async function initAgent(userId: string) {
+async function getWalletTransactions(walletAddress: string) {
+	const address = new Address("base-sepolia", walletAddress);
+
+	let transactions = await address.listTransactions({ limit: 5 });
+	console.log("transactions", transactions.data);
+}
+
+async function initAgent(userId: string, wallet: string) {
 	try {
 		const llm = new ChatOpenAI({
 			model: "gpt-4o",
@@ -135,6 +152,9 @@ async function initAgent(userId: string) {
 		const walletInfo = await Wallet.import({
 			mnemonicPhrase: process.env.WALLET_MNEMONIC_PHRASE!,
 		});
+
+		// pool information
+		// getWalletTransactions("0x5413eb0c19d3a7ca4876c02036c6decc390f3687");
 
 		const walletProvider = await CdpWalletProvider.configureWithWallet({
 			apiKeyId: CDP_API_KEY,
@@ -160,7 +180,7 @@ async function initAgent(userId: string) {
 		memoryStore[userId] = new MemorySaver();
 
 		const agentConfig: AgentConfig = {
-			configurable: { thread_id: userId },
+			configurable: { thread_id: userId, walletAddress: wallet },
 		};
 
 		const allTools = [...chamaTools, ...tools];
@@ -230,10 +250,27 @@ async function handleMessage(message: DecodedMessage, client: Client) {
 	try {
 		const senderAddress = message.senderInboxId.toLowerCase();
 		const botAddress = client.inboxId.toLowerCase();
+		const conversationId = message.conversationId;
 
+		const convo = await client.conversations.getConversationById(conversationId);
+
+		const members = await convo.members();
+
+		
+
+		// console.log("members[0].inboxId", members[0].inboxId);
+
+		// console.log("members", members[0].accountIdentifiers[0].identifier);
+
+		console.log("message", message);
 		if (senderAddress === botAddress) {
 			return; // Ignore self-messages
 		}
+
+		const senderDetails = members.find((member) => member.inboxId === senderAddress)
+
+		const walletAddress = senderDetails.accountIdentifiers[0].identifier
+
 
 		console.log(`Received message from ${senderAddress}: ${message.content}`);
 
@@ -241,7 +278,7 @@ async function handleMessage(message: DecodedMessage, client: Client) {
 		let agentData = agentStore[senderAddress];
 		if (!agentData) {
 			// Initialize agent only if it doesn't exist
-			agentData = await initAgent(senderAddress);
+			agentData = await initAgent(senderAddress, walletAddress);
 			agentStore[senderAddress] = agentData;
 		}
 		const { agent, config } = agentData;
