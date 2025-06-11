@@ -1,3 +1,4 @@
+"use client";
 import { ONCHAINKIT_API_KEY } from "@/helpers/constants";
 import { OnchainKitProvider } from "@coinbase/onchainkit";
 import { FC, ReactNode } from "react";
@@ -25,7 +26,7 @@ const wagmiConfig = createConfig({
 const OnchainkitAppProvider: FC<OnchainkitProviderProps> = ({ children }) => {
 	return (
 		<WagmiProvider config={wagmiConfig}>
-			<OnchainKitProvider apiKey={ONCHAINKIT_API_KEY} chain={baseSepolia}>
+			<OnchainKitProvider config={{ wallet: { preference: "eoaOnly" } }} apiKey={ONCHAINKIT_API_KEY} chain={baseSepolia}>
 				{children}
 			</OnchainKitProvider>
 		</WagmiProvider>
