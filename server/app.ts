@@ -13,6 +13,7 @@ import { AIMessage, BaseMessage, HumanMessage } from "@langchain/core/messages";
 import { StructuredTool } from "@langchain/core/tools";
 import { ChatPromptTemplate, MessagesPlaceholder } from "@langchain/core/prompts";
 import { Runnable, RunnableConfig } from "@langchain/core/runnables";
+import * as fs from "fs";
 
 Coinbase.configure({ apiKeyName: CDP_API_KEY, privateKey: CDP_API_KEY_PRIVATE_KEY.replace(/\\n/g, "\n") });
 
@@ -27,7 +28,7 @@ interface AgentConfig {
 }
 
 const memoryStore: Record<string, MemorySaver> = {};
-const agentStore: Record<string, Agent> = {};
+const agentStore: Record<string, { agent: Agent; config: AgentConfig }> = {};
 const chamaTools = [groupSavingsTool, lendingTool, votingTool, investmentTool, askHumanTool];
 
 async function createAgent({ llm, tools, systemMessage }: { llm: ChatOpenAI; tools: StructuredTool[]; systemMessage: string }) {
@@ -35,16 +36,16 @@ async function createAgent({ llm, tools, systemMessage }: { llm: ChatOpenAI; too
 	let prompt = ChatPromptTemplate.fromMessages([
 		[
 			"system",
-			"You are a helpful AI assistant for the Chama DeFi project, managing a single savings pool for group-based financial activities. " +
-				"All actions occur within a single group (no group IDs needed). Users are identified by their wallet address (e.g., '0x123...'). " +
-				"Interpret natural language inputs to perform actions using the provided tools: deposit funds, request loans, vote on loans, or propose investments. " +
-				"For deposits, call groupSavingsTool with walletAddress and amount. " +
-				"For loan requests, call lendingTool with walletAddress, amount, collateral, and interestRate (0-20%). " +
-				"For voting on loans, call votingTool with walletAddress, loanId, and vote (true/false). " +
-				"For proposing investments, call investmentTool with walletAddress, description, amount, and action='propose'. " +
-				"If a tool response includes 'Please confirm' or 'requires confirmation', call askHuman to pause for human input (approve, reject, or adjust with JSON). " +
-				"If the user input is ambiguous, ask for clarification using askHuman. " +
-				"Prefix final answers with 'FINAL ANSWER' when the action is complete and no further input is needed. " +
+			"You are a helpful AI assistant for the Chama DeFi project, managing a single savings pool for group-based financial activities on the Base Sepolia testnet (chain ID: 84532). " +
+				"The user's wallet address is provided in the message metadata as additional_kwargs.walletAddress (e.g., '0x123...'). ALWAYS use this walletAddress for tool calls unless the user explicitly provides a different one. " +
+				"Interpret natural language inputs to perform actions using the provided tools: deposit funds, request loans, vote on loans, propose investments, or check balances. " +
+				"For deposits, call groupSavingsTool with walletAddress and amount. For loan requests, call lendingTool with walletAddress, amount, collateral, and interestRate (0-20%). " +
+				"For voting on loans, call votingTool with walletAddress, loanId, and vote (true/false). For proposing investments, call investmentTool with walletAddress, description, amount, and action='propose'. " +
+				"If a tool response includes 'Please confirm' or 'requires confirmation', call askHuman to pause and request user input ('approve', 'reject', or 'adjust' with JSON, e.g., {{'amount': 500}}). " +
+				"If the input is ambiguous or missing required parameters (e.g., amount for deposits, collateral for loans), call askHuman to request clarification, including the walletAddress in the prompt for context. " +
+				"Respond conversationally to casual inputs (e.g., 'hi', 'hello') with a friendly clarification, suggesting actions like 'Want to deposit funds or check your balance? Try \"deposit 10\" or \"check balance\".' " +
+				'For informal or strong language, respond playfully but guide toward valid actions, e.g., \'Spicy vibes! 😎 Let’s do business—try "deposit 10" or "loan 100".\' ' +
+				"Maintain conversation context across messages to avoid redundant requests. Prefix final responses with 'FINAL ANSWER' when the action is complete and no further input is needed. " +
 				"Available tools: {tool_names}.\n{system_message}",
 		],
 		new MessagesPlaceholder("messages"),
@@ -63,11 +64,9 @@ function askHuman(state: typeof MessagesAnnotation.State): Partial<typeof Messag
 	const toolCallId = lastMessage.tool_calls?.[0].id;
 	console.log(`Human input required: ${lastMessage.content}`);
 	console.log("Options: approve, reject, adjust (with JSON input)");
-	// Human input is provided via Command({ resume: ... }) in stream; this node waits
-	return { messages: [] }; // Return empty messages; resume handled by Command
+	return { messages: [] };
 }
 
-// Router function
 function shouldContinue(state: typeof MessagesAnnotation.State): "action" | "askHuman" | typeof END {
 	const lastMessage = state.messages[state.messages.length - 1] as AIMessage;
 
@@ -83,6 +82,12 @@ function shouldContinue(state: typeof MessagesAnnotation.State): "action" | "ask
 	return "action";
 }
 
+function ensureLocalStorage() {
+	if (!fs.existsSync(XMTP_STORAGE_DIR)) {
+		fs.mkdirSync(XMTP_STORAGE_DIR, { recursive: true });
+	}
+}
+
 async function initXMTPClient() {
 	const signer = createSigner(WALLET_KEY);
 	const dbEncrptionKey = getEncryptionKeyFromHex(ENCRYPTION_KEY);
@@ -90,11 +95,15 @@ async function initXMTPClient() {
 	const identifier = await signer.getIdentifier();
 	const address = identifier.identifier;
 
-	const client = await Client.create(signer, { dbEncryptionKey: dbEncrptionKey, env: XMTP_ENV as XmtpEnv, apiUrl: "https://grpc.dev.xmtp.network:443", dbPath: `${XMTP_STORAGE_DIR}/${XMTP_ENV}-${address}` });
+	const client = await Client.create(signer, {
+		dbEncryptionKey: dbEncrptionKey,
+		env: XMTP_ENV as XmtpEnv,
+		apiUrl: "https://grpc.dev.xmtp.network:443",
+		dbPath: `${XMTP_STORAGE_DIR}/${XMTP_ENV}-${address}`,
+	});
 
 	void logAgentDetails(client);
 
-	// Sync Conversations from the network to update the local instance
 	console.log("✓ Syncing conversations...");
 	await client.conversations.sync();
 
@@ -138,7 +147,10 @@ async function initAgent(userId: string) {
 			cdpApiKeyId: CDP_API_KEY,
 			cdpApiKeySecret: CDP_API_KEY_PRIVATE_KEY.replace(/\\n/g, "\n"),
 			walletProvider,
-			actionProviders: [walletActionProvider(), erc20ActionProvider()],
+			actionProviders: [
+				// walletActionProvider(),
+				// erc20ActionProvider()
+			],
 		} satisfies AgentKitOptions;
 
 		const agentKit = await AgentKit.from(options);
@@ -178,7 +190,7 @@ async function initAgent(userId: string) {
 		}
 
 		const workflow = new StateGraph(MessagesAnnotation)
-			.addNode("agent", chamaNode)
+			.addNode("agent", callModel)
 			.addNode("action", toolNode)
 			.addNode("askHuman", askHuman)
 			.addEdge(START, "agent")
@@ -187,8 +199,6 @@ async function initAgent(userId: string) {
 			.addConditionalEdges("agent", shouldContinue);
 
 		const app = workflow.compile({ checkpointer: memoryStore[userId] });
-
-		agentStore[userId] = app;
 
 		return { agent: app, config: agentConfig };
 	} catch (error) {
@@ -201,13 +211,11 @@ async function processMessage(agent: Agent, config: AgentConfig, message: string
 	let response = "";
 	try {
 		const stream = await agent.stream({ messages: [new HumanMessage({ content: message, additional_kwargs: { walletAddress: senderAddress } })] }, config);
-		for await (const chunk of stream) {
-			if (chunk && typeof chunk === "object" && "agent" in chunk) {
-				const agentChunk = chunk as { agent: { messages: Array<{ content: unknown }> } };
-				response += String(agentChunk.agent.messages[0].content) + "\n";
-			} else if (chunk && typeof chunk === "object" && "askHuman" in chunk) {
-				const askHumanChunk = chunk as { askHuman: { messages: Array<{ content: unknown }> } };
-				response += String(askHumanChunk.askHuman.messages[0]?.content || "Please respond with 'approve', 'reject', or 'adjust' (with JSON, e.g., {\"amount\": 500}).") + "\n";
+		for await (const event of stream) {
+			if (!event.__end__) {
+				const node = Object.keys(event)[0];
+				const recentMsg = event[node].messages[event[node].messages.length - 1] as BaseMessage;
+				response += String(recentMsg.content) + "\n";
 			}
 		}
 		return response.trim() || "Action processed. Awaiting your next input.";
@@ -229,11 +237,49 @@ async function handleMessage(message: DecodedMessage, client: Client) {
 
 		console.log(`Received message from ${senderAddress}: ${message.content}`);
 
-		const { agent, config } = await initAgent(senderAddress);
-		let response = await processMessage(agent, config, String(message.content), senderAddress);
+		// Check if agent is already initialized for this user
+		let agentData = agentStore[senderAddress];
+		if (!agentData) {
+			// Initialize agent only if it doesn't exist
+			agentData = await initAgent(senderAddress);
+			agentStore[senderAddress] = agentData;
+		}
+		const { agent, config } = agentData;
+
+		// Check if the message is an exit command
+		if ((message.content as string).toLowerCase() === "exit") {
+			conversation = await client.conversations.getConversationById(message.conversationId);
+			if (conversation) {
+				await conversation.send("AI: Exiting Chama DeFi. Goodbye!");
+			}
+			// Clear memory and agent for this user
+			delete memoryStore[senderAddress];
+			delete agentStore[senderAddress];
+			return;
+		}
+
+		// Check current state for HITL
+		let state = await agent.getState(config);
+		let response = "";
+
+		if (state.next.includes("askHuman")) {
+			// Handle HITL response
+			console.log(`AI: Resuming with human input: ${message.content}`);
+			const stream = await agent.stream({ resume: message.content }, config);
+			for await (const event of stream) {
+				if (!event.__end__) {
+					const node = Object.keys(event)[0];
+					const recentMsg = event[node].messages[event[node].messages.length - 1] as BaseMessage;
+					response += String(recentMsg.content) + "\n";
+				}
+			}
+		} else {
+			// Process new message
+			response = await processMessage(agent, config, String(message.content), senderAddress);
+		}
 
 		// Check if agent is paused for human input
-		const state = await agent.getState(config);
+		state = await agent.getState(config);
 		if (state.next.includes("askHuman")) {
 			const lastMessage = state.values.messages[state.values.messages.length - 1] as BaseMessage;
 			response = `${lastMessage.content}\nPlease respond with 'approve', 'reject', or 'adjust' (with JSON, e.g., {\"amount\": 500}).`;
@@ -243,8 +289,8 @@ async function handleMessage(message: DecodedMessage, client: Client) {
 		if (!conversation) {
 			throw new Error(`Could not find conversation for ID: ${message.conversationId}`);
 		}
-		await conversation.send(response);
-		console.log(`Sent response to ${senderAddress}: ${response}`);
+		await conversation.send(response.trim());
+		console.log(`Sent response to ${senderAddress}: ${response.trim()}`);
 	} catch (error) {
 		console.error("Error handling message:", error);
 		if (conversation) {
@@ -265,10 +311,12 @@ async function startMessageListener(client: Client) {
 
 async function main(): Promise<void> {
 	console.log("Initializing Chama DeFi Bot on XMTP...");
+	ensureLocalStorage();
 	try {
 		const xmtpClient = await initXMTPClient();
 		await startMessageListener(xmtpClient);
 	} catch (error) {
+		console.log(error);
 		console.error("Failed to start bot:", error);
 		process.exit(1);
 	}
