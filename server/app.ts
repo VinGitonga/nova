@@ -154,7 +154,7 @@ async function initAgent(userId: string, wallet: string) {
 		});
 
 		// pool information
-		// getWalletTransactions("0x5413eb0c19d3a7ca4876c02036c6decc390f3687");
+		getWalletTransactions("0x5413eb0c19d3a7ca4876c02036c6decc390f3687");
 
 		const walletProvider = await CdpWalletProvider.configureWithWallet({
 			apiKeyId: CDP_API_KEY,

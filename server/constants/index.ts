@@ -14,3 +14,5 @@ export const CDP_WALLET_SECRET = process.env.CDP_WALLET_SECRET;
 export const WALLET_MNEMONIC_PHRASE = process.env.WALLET_MNEMONIC_PHRASE;
 export const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 export const COINGECKO_API_KEY = process.env.COINGECKO_API_KEY;
+export const COINGECKO_BASE_URL = "https://api.coingecko.com/api/v3"
+export const GROUP_WALLET_ADDRESS = "0x41a9dc633faFd6cfA50107eD7040a1c39b5e1319"
