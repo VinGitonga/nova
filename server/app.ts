@@ -21,6 +21,7 @@ import {
 	investmentVotingTool,
 	lendingTool,
 	listContributionsTool,
+	listInterestDistributionsTool,
 	resetPoolTool,
 	verifyGroupSavingTransactionHash,
 	verifyLoanRepaymentTool,
@@ -68,7 +69,8 @@ const chamaTools = [
 	distributeInterestTool,
 	withdrawFundsTool,
 	listContributionsTool,
-	resetPoolTool
+	resetPoolTool,
+	listInterestDistributionsTool
 ];
 
 async function createAgent({ llm, tools, systemMessage }: { llm: ChatOpenAI; tools: StructuredTool[]; systemMessage: string }) {

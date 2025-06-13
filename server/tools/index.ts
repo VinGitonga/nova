@@ -231,6 +231,20 @@ export const verifyGroupSavingTransactionHash = tool(
 					// Save updated loan document
 					await db.put(loan);
 
+					// If there's interest to distribute, create an interest distribution record
+					if (interestPortion > 0) {
+						const interestDistribution: InterestDistribution = {
+							_id: `interest_${loan._id}_${Date.now()}`,
+							type: "interest_distribution",
+							loanId: loan._id,
+							amount: interestPortion,
+							timestamp: new Date().toISOString(),
+							status: "pending"
+						};
+						await db.put(interestDistribution);
+						response += `  • Interest Distribution Created: $${interestPortion.toFixed(2)}\n`;
+					}
+
 					remainingAmount -= paymentAmount;
 
 					response += `- Applied $${paymentAmount.toFixed(2)} to loan ${loan._id}:\n`;
@@ -292,6 +306,8 @@ export const verifyGroupSavingTransactionHash = tool(
 			response += `- Your total contribution: $${totalContribution.toFixed(2)}\n`;
 			response += `- Maximum loan amount: $${(totalContribution * 5).toFixed(2)} (5x contribution)\n`;
 			response += `- Total pool size: $${groupDoc.totalPool.toFixed(2)}\n\n`;
+
+			response += `Use listInterestDistributionsTool to see pending interest distributions.`;
 
 			return response;
 		} catch (error) {
@@ -1118,108 +1134,168 @@ export const verifyLoanRepaymentTool = tool(
 			return "Wallet address missing in configuration.";
 		}
 
-		// Fetch transactions for the group wallet
-		const transactions = await getWalletTransactions(GROUP_WALLET_ADDRESS);
-
-		// Find transaction by hash and verify it goes to the group wallet
-		const transaction = transactions.data.find((item) => item.content().hash === hash && item.content().to.toLowerCase() === GROUP_WALLET_ADDRESS.toLowerCase());
-
-		if (!transaction) {
-			return `No transaction found with hash ${hash} for group wallet ${GROUP_WALLET_ADDRESS}.`;
-		}
-
-		const amountInWei = transaction.content().value;
-		const from = transaction.content().from;
-		const transactionTimestamp = transaction.content().block_timestamp;
-
-		// Verify the transaction is from the correct wallet
-		if (from.toLowerCase() !== walletAddress.toLowerCase()) {
-			return `Transaction ${hash} is from wallet ${from}, but you are using wallet ${walletAddress}. Please use the correct wallet address.`;
-		}
-
-		// Check for duplicate transaction
-		const contribId = `contrib_${walletAddress}_${hash}`;
 		try {
-			const existingContrib = await db.get(contribId);
-			if (existingContrib) {
-				// If contribution exists, show its details
-				const contrib = existingContrib as IContribution;
-				return (
-					`Transaction ${hash} has already been processed:\n` +
-					`- Amount: $${contrib.amountInUsd.toFixed(2)} (${contrib.amountInEth.toFixed(6)} ETH)\n` +
-					`- Date: ${new Date(contrib.transactionTimestamp || "").toLocaleString()}\n` +
-					`- Status: Verified`
+			// Get all transactions for the group wallet
+			const transactions = await getWalletTransactions(GROUP_WALLET_ADDRESS);
+
+			// Find the transaction with the provided hash
+			const transaction = transactions.data.find(
+				(item) => item.content().hash === hash
+			);
+			if (!transaction) {
+				return `Transaction ${hash} not found. Please verify the hash and try again.`;
+			}
+
+			// Verify the transaction is to the group wallet
+			if (transaction.content().to.toLowerCase() !== GROUP_WALLET_ADDRESS.toLowerCase()) {
+				return `Transaction ${hash} is not a deposit to the group wallet.`;
+			}
+
+			// Verify the transaction is from the correct wallet
+			if (transaction.content().from.toLowerCase() !== walletAddress.toLowerCase()) {
+				return `Transaction ${hash} is not from your wallet address.`;
+			}
+
+			// Convert Wei to USD and ETH
+			const amountInWei = transaction.content().value;
+			const transactionAmts = await convertWeiToUSD(amountInWei);
+			const amountInUsd = transactionAmts.usdAmount.toNumber();
+			const amountInEth = transactionAmts.ethAmount.toNumber();
+
+			// Get active loans for the user
+			const allDocs = await db.allDocs({ include_docs: true });
+			const activeLoans = allDocs.rows
+				.filter(
+					(row) =>
+						row.doc?.type === "loan" &&
+						(row.doc as Loan).walletAddress === walletAddress &&
+						(row.doc as Loan).status === "approved" &&
+						(row.doc as Loan).paidAmount !== (row.doc as Loan).amount
+				)
+				.map((row) => row.doc as Loan);
+
+			if (activeLoans.length === 0) {
+				return `No active loans found for your wallet.`;
+			}
+
+			let remainingAmount = amountInUsd;
+			let response = `Processing transaction ${hash}:\n`;
+			response += `- Total Amount: $${amountInUsd.toFixed(2)} (${amountInEth.toFixed(6)} ETH)\n`;
+
+			// Process each active loan
+			for (const loan of activeLoans) {
+				const remainingLoanAmount = loan.amount - (loan.paidAmount || 0);
+				if (remainingLoanAmount <= 0) continue;
+
+				const paymentAmount = Math.min(remainingAmount, remainingLoanAmount);
+				const interestPortion = Math.min(
+					paymentAmount,
+					remainingLoanAmount - (loan.amount - (loan.interestPaid || 0))
 				);
+
+				// Create loan payment record
+				const loanPayment: LoanPayment = {
+					amount: paymentAmount,
+					timestamp: new Date().toISOString(),
+					transactionHash: hash,
+					interestAmount: interestPortion
+				};
+
+				// Update loan document
+				loan.paidAmount = (loan.paidAmount || 0) + paymentAmount;
+				loan.interestPaid = (loan.interestPaid || 0) + interestPortion;
+				loan.payments = loan.payments || [];
+				loan.payments.push(loanPayment);
+
+				// Update loan status if fully paid
+				if (loan.paidAmount >= loan.amount) {
+					loan.status = "paid";
+				}
+
+				// Save updated loan document
+				await db.put(loan);
+
+				// If there's interest to distribute, create an interest distribution record
+				if (interestPortion > 0) {
+					const interestDistribution: InterestDistribution = {
+						_id: `interest_${loan._id}_${Date.now()}`,
+						type: "interest_distribution",
+						loanId: loan._id,
+						amount: interestPortion,
+						timestamp: new Date().toISOString(),
+						status: "pending"
+					};
+					await db.put(interestDistribution);
+					response += `  • Interest Distribution Created: $${interestPortion.toFixed(2)}\n`;
+				}
+
+				remainingAmount -= paymentAmount;
+
+				response += `- Applied $${paymentAmount.toFixed(2)} to loan ${loan._id}:\n`;
+				response += `  • Principal: $${(paymentAmount - interestPortion).toFixed(2)}\n`;
+				response += `  • Interest: $${interestPortion.toFixed(2)}\n`;
+				response += `  • Remaining Balance: $${(remainingLoanAmount - paymentAmount).toFixed(2)}\n`;
+				response += `  • Loan Status: ${loan.status}\n`;
+				response += `  • Payment Recorded: Yes\n`;
+
+				if (remainingAmount <= 0) break;
 			}
-		} catch (error) {
-			if (error.status !== 404) {
-				console.error("Error checking existing contribution:", error);
-				return "Error verifying transaction uniqueness.";
+
+			// Get group doc for pool updates
+			const groupDoc = (await db.get("chama")) as IGroup;
+
+			// If there's remaining amount, add it to contributions
+			if (remainingAmount > 0) {
+				// Save contribution
+				const contribution: IContribution = {
+					_id: `contrib_${walletAddress}_${hash}`,
+					type: "contribution",
+					walletAddress,
+					amountInWei,
+					amountInEth,
+					amountInUsd: remainingAmount,
+					transactionHash: hash,
+					transactionTimestamp: new Date().toISOString(),
+				};
+
+				await db.put(contribution);
+
+				// Update group total pool
+				groupDoc.totalPool += remainingAmount;
+				await db.put(groupDoc);
+
+				response += `\nRemaining Amount Added to Contributions:\n`;
+				response += `- Amount: $${remainingAmount.toFixed(2)} (${(remainingAmount / amountInUsd * amountInEth).toFixed(6)} ETH)\n`;
+			} else {
+				// Even if no remaining amount, still update the group doc to ensure consistency
+				await db.put(groupDoc);
 			}
-		}
 
-		// Convert wei to USD (and ETH, assuming convertWeiToUSD returns both)
-		let transactionAmts;
-		try {
-			transactionAmts = await convertWeiToUSD(amountInWei);
+			// Get user's total contribution after update
+			const userContributions = allDocs.rows
+				.filter(
+					(row) =>
+						row.doc?.type === "contribution" &&
+						(row.doc as IContribution).walletAddress === walletAddress
+				)
+				.map((row) => row.doc as IContribution);
+
+			const totalContribution = userContributions.reduce(
+				(sum, contrib) => sum + contrib.amountInUsd,
+				0
+			);
+
+			response += `\nUpdated Status:\n`;
+			response += `- Your total contribution: $${totalContribution.toFixed(2)}\n`;
+			response += `- Maximum loan amount: $${(totalContribution * 5).toFixed(2)} (5x contribution)\n`;
+			response += `- Total pool size: $${groupDoc.totalPool.toFixed(2)}\n\n`;
+
+			response += `Use listInterestDistributionsTool to see pending interest distributions.`;
+
+			return response;
 		} catch (error) {
-			console.error("Error converting amount:", error);
-			return "Failed to convert transaction amount to USD.";
+			return `Error verifying transaction: ${error}`;
 		}
-
-		// Save contribution to PouchDB
-		const contribution: IContribution = {
-			_id: contribId,
-			type: "contribution",
-			walletAddress: from,
-			amountInWei,
-			amountInEth: transactionAmts.ethAmount?.toNumber() || new BigNumber(amountInWei).dividedBy("1000000000000000000").toNumber(),
-			amountInUsd: transactionAmts.usdAmount.toNumber(),
-			transactionHash: hash,
-			transactionTimestamp,
-		};
-
-		try {
-			await db.put(contribution);
-		} catch (error) {
-			console.error("Error saving contribution:", error);
-			return "Failed to save contribution to database.";
-		}
-
-		// Update group total pool
-		let groupDoc: IGroup;
-		try {
-			groupDoc = (await db.get("chama").catch(
-				() =>
-					({
-						_id: "chama",
-						type: "group",
-						name: "Chama",
-						totalPool: 0,
-					} as IGroup)
-			)) as IGroup;
-
-			groupDoc.totalPool += contribution.amountInUsd;
-			await db.put(groupDoc);
-		} catch (error) {
-			console.error("Error updating group pool:", error);
-			return "Failed to update group savings pool.";
-		}
-
-		// Get user's total contribution after update
-		const allDocs = await db.allDocs({ include_docs: true });
-		const userContributions = allDocs.rows.filter((row) => row.doc?.type === "contribution" && (row.doc as IContribution).walletAddress === walletAddress).map((row) => row.doc as IContribution);
-
-		const totalContribution = userContributions.reduce((sum, contrib) => sum + contrib.amountInUsd, 0);
-
-		return (
-			`Verified transaction ${hash}:\n` +
-			`- Deposited: $${contribution.amountInUsd.toFixed(2)} (${contribution.amountInEth.toFixed(6)} ETH)\n` +
-			`- Date: ${new Date(contribution.transactionTimestamp || "").toLocaleString()}\n` +
-			`- Updated total pool: $${groupDoc.totalPool.toFixed(2)}\n` +
-			`- Your total contribution: $${totalContribution.toFixed(2)}\n` +
-			`- Maximum loan amount: $${(totalContribution * 5).toFixed(2)} (5x contribution)`
-		);
 	},
 	{
 		name: "verifyLoanRepaymentTool",
@@ -1988,5 +2064,85 @@ Please ensure all loans are repaid before resetting the pool.`;
 		schema: z.object({
 			confirm: z.string().describe("Confirmation string. Must be 'YES_RESET_POOL' to proceed."),
 		}),
+	}
+);
+
+export const listInterestDistributionsTool = tool(
+	async ({}, config: RunnableConfig) => {
+		const walletAddress = config["configurable"]["walletAddress"];
+		if (!walletAddress) {
+			return "Wallet address missing in configuration.";
+		}
+
+		// Get all interest distributions
+		const allDocs = await db.allDocs({ include_docs: true });
+		const interestDistributions = allDocs.rows
+			.filter((row) => row.doc?.type === "interest_distribution")
+			.map((row) => row.doc as InterestDistribution);
+
+		if (interestDistributions.length === 0) {
+			return "No interest distributions found.";
+		}
+
+		let response = `Interest Distributions:\n\n`;
+
+		// Group by status
+		const pendingDistributions = interestDistributions.filter(dist => dist.status === "pending");
+		const distributedDistributions = interestDistributions.filter(dist => dist.status === "distributed");
+
+		// Show pending distributions first
+		if (pendingDistributions.length > 0) {
+			response += `Pending Distributions:\n`;
+			pendingDistributions.forEach(dist => {
+				const date = new Date(dist.timestamp).toLocaleString();
+				response += `- ID: ${dist._id}\n`;
+				response += `  • Loan ID: ${dist.loanId}\n`;
+				response += `  • Amount: $${dist.amount.toFixed(2)}\n`;
+				response += `  • Created: ${date}\n`;
+				response += `  • Status: ${dist.status}\n\n`;
+			});
+		}
+
+		// Show distributed interest
+		if (distributedDistributions.length > 0) {
+			response += `Distributed Interest:\n`;
+			distributedDistributions.forEach(dist => {
+				const date = new Date(dist.timestamp).toLocaleString();
+				response += `- ID: ${dist._id}\n`;
+				response += `  • Loan ID: ${dist.loanId}\n`;
+				response += `  • Amount: $${dist.amount.toFixed(2)}\n`;
+				response += `  • Created: ${date}\n`;
+				response += `  • Status: ${dist.status}\n`;
+				
+				if (dist.distributionDetails && dist.distributionDetails.length > 0) {
+					response += `  • Distribution Details:\n`;
+					dist.distributionDetails.forEach(detail => {
+						response += `    - ${detail.walletAddress}: $${detail.amount.toFixed(2)}\n`;
+						if (detail.transactionHash) {
+							response += `      Transaction: ${detail.transactionHash}\n`;
+						}
+					});
+				}
+				response += `\n`;
+			});
+		}
+
+		// Show summary
+		const totalPending = pendingDistributions.reduce((sum, dist) => sum + dist.amount, 0);
+		const totalDistributed = distributedDistributions.reduce((sum, dist) => sum + dist.amount, 0);
+
+		response += `Summary:\n`;
+		response += `- Total Pending: $${totalPending.toFixed(2)}\n`;
+		response += `- Total Distributed: $${totalDistributed.toFixed(2)}\n`;
+		response += `- Total Interest: $${(totalPending + totalDistributed).toFixed(2)}\n\n`;
+
+		response += `To distribute pending interest, use distributeInterestTool with the distribution ID.`;
+
+		return response;
+	},
+	{
+		name: "listInterestDistributionsTool",
+		description: "Lists all interest distributions with their IDs, showing both pending and distributed interest. Includes distribution details and transaction hashes for completed distributions.",
+		schema: z.object({}),
 	}
 );
