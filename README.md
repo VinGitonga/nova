@@ -55,6 +55,9 @@ Nova is a decentralized AI agent that revolutionizes traditional group finance (
 [![Screenshot-2025-06-14-at-00-30-35.png](https://i.postimg.cc/RVZr6DrL/Screenshot-2025-06-14-at-00-30-35.png)](https://postimg.cc/Sj31HVxn)
 
 
+## Proof of Deployment
+https://base-sepolia.blockscout.com/tx/0x538dfa8a3923eaedf39c7a208c50a90440d1734ab62e1cc3965a522c0e4a0250
+
 ## Technical Stack
 
 ### Core Technologies
