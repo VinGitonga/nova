@@ -6,6 +6,7 @@ import { TbWallet, TbMoneybag, TbBox, TbLayout2 } from "react-icons/tb";
 import { RxArrowTopRight } from "react-icons/rx";
 import { ReactNode } from "react";
 import { CiGlobe } from "react-icons/ci";
+import HomeConnectBtn from "@/components/btn/home-connect-btn";
 
 interface HomeLinkProps {
 	isActive?: boolean;
@@ -51,7 +52,7 @@ const page = () => {
 						<p className="text-lg">Modernize group finance with Nova's decentralized platform. Pool funds, vote fairly, and grow wealth as a community</p>
 					</div>
 					<div className="mt-5">
-						<HomeConnectBtn />
+						<HomeConnectBtn text="Chat" />
 					</div>
 				</div>
 				<div className="col-auto md:col-span-4">
@@ -124,19 +125,6 @@ const HomeLink = ({ text, isActive, href }: HomeLinkProps) => {
 				{text}
 			</p>
 		</Link>
-	);
-};
-
-const HomeConnectBtn = () => {
-	return (
-		<button className="transition-all duration-300 hover:scale-105 active:scale-95">
-			<div className="bg-gradient-to-r from-[#201641] to-[#FF6106] font-bold text-white rounded-4xl px-6 py-3 transition-all duration-300 hover:shadow-xl hover:shadow-[#FF6106]/30">
-				<div className="flex items-center gap-2">
-					<p>Connect Wallet</p>
-					<ArrowRight />
-				</div>
-			</div>
-		</button>
 	);
 };
 
