@@ -15,11 +15,17 @@ import {
 	checkLoanEligibilityTool,
 	checkPaymentHistoryTool,
 	checkWalletAddressTool,
+	distributeInterestTool,
 	groupSavingsTool,
 	investmentTool,
+	investmentVotingTool,
 	lendingTool,
+	listContributionsTool,
+	resetPoolTool,
 	verifyGroupSavingTransactionHash,
+	verifyLoanRepaymentTool,
 	votingTool,
+	withdrawFundsTool,
 } from "tools";
 import { convertToOpenAITool } from "@langchain/core/utils/function_calling";
 import { AIMessage, BaseMessage, HumanMessage } from "@langchain/core/messages";
@@ -56,7 +62,13 @@ const chamaTools = [
 	checkGroupStatusTool,
 	checkLoanEligibilityTool,
 	checkContributionBalanceTool,
-	verifyGroupSavingTransactionHash
+	verifyGroupSavingTransactionHash,
+	investmentVotingTool,
+	verifyLoanRepaymentTool,
+	distributeInterestTool,
+	withdrawFundsTool,
+	listContributionsTool,
+	resetPoolTool
 ];
 
 async function createAgent({ llm, tools, systemMessage }: { llm: ChatOpenAI; tools: StructuredTool[]; systemMessage: string }) {
