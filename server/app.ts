@@ -133,7 +133,7 @@ async function initXMTPClient() {
 	// check if group exists
 	const existingGroups = client.conversations.listGroups();
 
-	const alreadyGroup = existingGroups.find((item) => item.name === "Nova Labs");
+	const alreadyGroup = existingGroups.find((item) => item.name === "Nova Group");
 
 	let group;
 
@@ -141,7 +141,7 @@ async function initXMTPClient() {
 		group = alreadyGroup;
 	} else {
 		// create a group,
-		group = await client.conversations.newGroupWithIdentifiers(groupMembers, { groupName: "Nova Labs", groupDescription: "Test Labs for XMTP with Coinbase AI" });
+		group = await client.conversations.newGroupWithIdentifiers(groupMembers, { groupName: "Nova Group", groupDescription: "Test Group for XMTP with Coinbase AI" });
 	}
 
 	return { client, group };
