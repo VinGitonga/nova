@@ -2,11 +2,13 @@ import { RunnableConfig } from "@langchain/core/runnables";
 import { tool } from "@langchain/core/tools";
 import PouchDB from "pouchdb";
 import { z } from "zod";
-import { Address, Coinbase, Wallet } from "@coinbase/coinbase-sdk";
+import { Address, Coinbase, Wallet, Amount } from "@coinbase/coinbase-sdk";
 import { GROUP_WALLET_ADDRESS, WALLET_MNEMONIC_PHRASE } from "../constants";
 import { convertWeiToUSD, getEthPriceToday } from "helpers";
 import { Command } from "@langchain/langgraph";
-import { AIMessage, ToolMessage } from "@langchain/core/messages";
+import { ToolMessage } from "@langchain/core/messages";
+import { BigNumber } from "bignumber.js";
+import Decimal from "decimal.js";
 
 interface IGroup {
 	_id: "chama";
@@ -69,7 +71,7 @@ export const groupSavingsTool = tool(
 		let ethPriceInUSD: BigNumber;
 		try {
 			const response = await getEthPriceToday();
-			ethPriceInUSD = new BigNumber(response.data.ethereum.usd);
+			ethPriceInUSD = new BigNumber(response);
 		} catch (error) {
 			console.error("Error fetching ETH price:", error);
 			return "Failed to fetch ETH price. Please try again later.";
@@ -201,11 +203,20 @@ async function getWalletTransactions(walletAddress: string) {
 	return transactions;
 }
 
-async function transferMoney(walletAddress: string, amount: number) {
+async function getBalance() {
+	const wallet = await Wallet.import({ mnemonicPhrase: WALLET_MNEMONIC_PHRASE });
+	const balance = await wallet.getBalance(Coinbase.assets.Eth);
+	console.log("balance", balance.toString());
+	// console.log("address", await wallet.getDefaultAddress());
+}
+
+async function transferMoney(walletAddress: string, amountInEth: Decimal) {
 	const wallet = await Wallet.import({ mnemonicPhrase: WALLET_MNEMONIC_PHRASE });
 
+	await getBalance();
+
 	const transfer = await wallet.createTransfer({
-		amount: amount,
+		amount: amountInEth.toNumber(),
 		assetId: Coinbase.assets.Eth,
 		destination: walletAddress,
 	});
@@ -213,7 +224,7 @@ async function transferMoney(walletAddress: string, amount: number) {
 	try {
 		await transfer.wait();
 
-		return transfer.getTransaction().content().hash;
+		return transfer.getTransaction().getTransactionHash();
 	} catch (err) {
 		console.log("transfer fail: error", err);
 		return null;
@@ -231,17 +242,19 @@ export const lendingTool = tool(
 			return "Loan amount must be positive.";
 		}
 
-		// Check contribution (1/5 of loan amount as "collateral")
-		const contribId = `contrib_${walletAddress}`;
-		let contrib: IContribution;
-		try {
-			contrib = (await db.get(contribId)) as IContribution;
-		} catch (error) {
-			contrib = { _id: contribId, type: "contribution", walletAddress, amountInWei: "0", amountInEth: 0, amountInUsd: 0, transactionHash: "", transactionTimestamp: "" } as IContribution;
-		}
-		const requiredContribution = amount / 5;
-		if ((contrib.amountInUsd || 0) < requiredContribution) {
-			return `Need to contribute at least $${requiredContribution.toFixed(2)} USD (1/5 of $${amount}) to borrow. Current contribution: $${(contrib.amountInUsd || 0).toFixed(2)}.`;
+		// Constants for loan requirements
+		const REQUIRED_CONTRIBUTION_PERCENTAGE = 20; // 20% of loan amount required as contribution
+
+		// Get all documents and filter for contributions from this wallet
+		const allDocs = await db.allDocs({ include_docs: true });
+		const contributions = allDocs.rows.filter((row) => row.doc?.type === "contribution" && (row.doc as IContribution).walletAddress === walletAddress).map((row) => row.doc as IContribution);
+
+		// Calculate total contribution from this wallet
+		const totalContribution = contributions.reduce((sum, contrib) => sum + (contrib.amountInUsd || 0), 0);
+		const requiredContribution = (amount * REQUIRED_CONTRIBUTION_PERCENTAGE) / 100;
+
+		if (totalContribution < requiredContribution) {
+			return `Need to contribute at least $${requiredContribution.toFixed(2)} USD (${REQUIRED_CONTRIBUTION_PERCENTAGE}% of $${amount}) to borrow. Current contribution: $${totalContribution.toFixed(2)}.`;
 		}
 
 		// Check pool funds
@@ -264,6 +277,7 @@ export const lendingTool = tool(
 			await db.put({
 				_id: loanId,
 				type: "loan",
+				walletAddress,
 				amount,
 				interestRate,
 				status: "pending",
@@ -282,7 +296,7 @@ export const lendingTool = tool(
 	},
 	{
 		name: "lendingTool",
-		description: "Requests a loan from the Chama pool, requiring a contribution of at least 1/5 of the loan amount and sufficient pool funds. Uses a fixed 10% interest rate.",
+		description: "Requests a loan from the Chama pool, requiring a contribution of at least 20% of the loan amount and sufficient pool funds. Uses a fixed 10% interest rate.",
 		schema: z.object({
 			amount: z.number().positive().describe("Loan amount in USD"),
 		}),
@@ -296,73 +310,288 @@ export const votingTool = tool(
 			return "Wallet address missing in configuration.";
 		}
 
-		const loan = (await db.get(loanId).catch(() => {
+		const currentLoanId = loanId ?? config["configurable"]["loanId"];
+
+		// Get the latest version of the loan document
+		let loan: Loan;
+		try {
+			loan = (await db.get(currentLoanId)) as Loan;
+		} catch (error) {
 			throw new Error(`Loan ${loanId} not found.`);
-		})) as Loan;
+		}
+
 		if (loan.status !== "pending") {
 			return `Loan ${loanId} is not open for voting. Status: ${loan.status}.`;
 		}
 
 		const existingVote = loan.votes.find((v) => v.walletAddress === walletAddress);
 		if (existingVote) {
-			return `Already voted on loan ${loanId}.`;
+			// Even if user already voted, check if loan can be approved
+			const group = (await db.get("chama").catch(() => {
+				throw new Error("Chama pool not found.");
+			})) as IGroup;
+
+			// Get all documents for contribution calculation
+			const allDocs = await db.allDocs({ include_docs: true });
+
+			// Calculate total voting weight from approving votes
+			const totalVotes = await loan.votes.reduce(async (acc: Promise<number>, v: { walletAddress: string; vote: boolean }) => {
+				if (!v.vote) return acc; // Only count approving votes
+
+				const voterContribs = allDocs.rows.filter((row) => row.doc?.type === "contribution" && (row.doc as IContribution).walletAddress === v.walletAddress).map((row) => row.doc as IContribution);
+
+				const voterWeight = voterContribs.reduce((sum, contrib) => sum + (contrib.amountInUsd || 0), 0);
+				return (await acc) + voterWeight;
+			}, Promise.resolve(0));
+
+			const totalPool = group.totalPool;
+			const approvalRatio = totalVotes / totalPool;
+
+			if (approvalRatio >= 0.6) {
+				// Try to update loan status with conflict handling
+				let retryCount = 0;
+				const maxRetries = 3;
+
+				while (retryCount < maxRetries) {
+					try {
+						loan.status = "approved";
+						await db.put(loan);
+						break;
+					} catch (error) {
+						if (error.name === "conflict") {
+							loan = (await db.get(currentLoanId)) as Loan;
+							if (loan.status !== "pending") {
+								return `Loan ${loanId} has already been ${loan.status}.`;
+							}
+							loan.status = "approved";
+							retryCount++;
+							if (retryCount === maxRetries) {
+								return "Failed to update loan status after multiple attempts. Please try again.";
+							}
+						} else {
+							throw error;
+						}
+					}
+				}
+
+				try {
+					// transfer the funds
+					const ethPriceInUSD = await getEthPriceToday();
+					// Convert USD amount to ETH using Decimal for precision
+					const ethAmount = new Decimal(loan.amount).dividedBy(new Decimal(ethPriceInUSD));
+					console.log("Transfer amount in ETH:", ethAmount.toString());
+					await getBalance();
+					const txHash = await transferMoney(loan.walletAddress, ethAmount);
+					console.log("txtttt", txHash);
+
+					if (!txHash) {
+						// Revert loan status if transfer fails
+						retryCount = 0;
+						while (retryCount < maxRetries) {
+							try {
+								loan.status = "pending";
+								await db.put(loan);
+								break;
+							} catch (error) {
+								console.log("error8888828", error);
+								if (error.name === "conflict") {
+									loan = (await db.get(currentLoanId)) as Loan;
+									loan.status = "pending";
+									retryCount++;
+									if (retryCount === maxRetries) {
+										return "Failed to revert loan status after transfer failure. Please contact support.";
+									}
+								} else {
+									throw error;
+								}
+							}
+						}
+						return `Loan ${loanId} has reached approval threshold (${(approvalRatio * 100).toFixed(2)}%). However, the fund transfer failed. Please try again.`;
+					}
+
+					return `Loan ${loanId} has been approved and funded. Approval ratio: ${(approvalRatio * 100).toFixed(2)}%. Transferred ${ethAmount.toString()} ETH ($${loan.amount.toFixed(2)} USD) to ${
+						loan.walletAddress
+					}. Transaction hash: ${txHash}`;
+				} catch (error) {
+					console.log("error99", error);
+					// Revert loan status if transfer fails
+					retryCount = 0;
+					while (retryCount < maxRetries) {
+						try {
+							loan.status = "pending";
+							await db.put(loan);
+							break;
+						} catch (error) {
+							console.log("5636errrro", error);
+							if (error.name === "conflict") {
+								loan = (await db.get(currentLoanId)) as Loan;
+								loan.status = "pending";
+								retryCount++;
+								if (retryCount === maxRetries) {
+									return "Failed to revert loan status after transfer failure. Please contact support.";
+								}
+							} else {
+								throw error;
+							}
+						}
+					}
+					return `Loan ${loanId} has reached approval threshold (${(approvalRatio * 100).toFixed(2)}%). However, the fund transfer failed: ${error.message}. Please try again.`;
+				}
+			}
+
+			return `Already voted on loan ${loanId}. Current approval ratio: ${(approvalRatio * 100).toFixed(2)}%.`;
 		}
+
+		// Get all documents and filter for contributions from this wallet
+		const allDocs = await db.allDocs({ include_docs: true });
+		const voterContributions = allDocs.rows.filter((row) => row.doc?.type === "contribution" && (row.doc as IContribution).walletAddress === walletAddress).map((row) => row.doc as IContribution);
+
+		// Calculate total contribution from this wallet
+		const voterTotalContribution = voterContributions.reduce((sum, contrib) => sum + (contrib.amountInUsd || 0), 0);
+		if (voterTotalContribution === 0) {
+			return `Cannot vote without any contributions. Please contribute to the Chama pool first.`;
+		}
+
+		// Add the vote and try to save with conflict handling
 		loan.votes.push({ walletAddress, vote });
-		await db.put(loan);
+
+		let retryCount = 0;
+		const maxRetries = 3;
+
+		while (retryCount < maxRetries) {
+			try {
+				await db.put(loan);
+				break; // Success, exit the retry loop
+			} catch (error) {
+				if (error.name === "conflict") {
+					// Get the latest version and retry
+					loan = (await db.get(currentLoanId)) as Loan;
+					// Check if vote was already added in the meantime
+					if (loan.votes.some((v) => v.walletAddress === walletAddress)) {
+						return `Already voted on loan ${loanId}.`;
+					}
+					// Re-add the vote to the latest version
+					loan.votes.push({ walletAddress, vote });
+					retryCount++;
+					if (retryCount === maxRetries) {
+						return "Failed to record vote after multiple attempts. Please try again.";
+					}
+				} else {
+					throw error; // Re-throw if it's not a conflict error
+				}
+			}
+		}
 
 		const group = (await db.get("chama").catch(() => {
 			throw new Error("Chama pool not found.");
 		})) as IGroup;
-		const contrib = await db.get(`contrib_${walletAddress}`).catch(
-			() =>
-				({
-					_id: `contrib_${walletAddress}`,
-					type: "contribution",
-					walletAddress,
-					amountInWei: "0",
-					amountInEth: 0,
-					amountInUsd: 0,
-					amount: 0,
-				} as IContribution)
-		);
+
+		// Calculate total voting weight from approving votes
 		const totalVotes = await loan.votes.reduce(async (acc: Promise<number>, v: { walletAddress: string; vote: boolean }) => {
-			const c = (await db.get(`contrib_${v.walletAddress}`).catch(
-				() =>
-					({
-						_id: `contrib_${v.walletAddress}`,
-						type: "contribution",
-						walletAddress: v.walletAddress,
-						amountInWei: "0",
-						amountInEth: 0,
-						amountInUsd: 0,
-						amount: 0,
-					} as IContribution)
-			)) as IContribution;
-			return (await acc) + (v.vote ? c.amountInUsd || 0 : 0);
+			if (!v.vote) return acc; // Only count approving votes
+
+			const voterContribs = allDocs.rows.filter((row) => row.doc?.type === "contribution" && (row.doc as IContribution).walletAddress === v.walletAddress).map((row) => row.doc as IContribution);
+
+			const voterWeight = voterContribs.reduce((sum, contrib) => sum + (contrib.amountInUsd || 0), 0);
+			return (await acc) + voterWeight;
 		}, Promise.resolve(0));
+
 		const totalPool = group.totalPool;
 		const approvalRatio = totalVotes / totalPool;
 
-		const status = approvalRatio >= 0.6 ? "approved" : "rejected";
-
 		if (approvalRatio >= 0.6) {
-			loan.status = status;
-			await db.put(loan);
-			// transfer the funds
-			const ethPriceInUSD = await getEthPriceToday();
-			const ethAmount = loan.amount / ethPriceInUSD;
-			const txHash = await transferMoney(loan.walletAddress, ethAmount);
-			if (!txHash) {
-				return `Voting complete for loan ${loanId}. Status: ${status}. Approval ratio: ${(approvalRatio * 100).toFixed(2)}%. However, the fund transfer failed. Please try again.`;
+			// Try to update loan status with conflict handling
+			retryCount = 0;
+			while (retryCount < maxRetries) {
+				try {
+					loan.status = "approved";
+					await db.put(loan);
+					break;
+				} catch (error) {
+					console.log("erroroor", error);
+					if (error.name === "conflict") {
+						loan = (await db.get(currentLoanId)) as Loan;
+						if (loan.status !== "pending") {
+							return `Loan ${loanId} has already been ${loan.status}.`;
+						}
+						loan.status = "approved";
+						retryCount++;
+						if (retryCount === maxRetries) {
+							return "Failed to update loan status after multiple attempts. Please try again.";
+						}
+					} else {
+						throw error;
+					}
+				}
 			}
-			return `Voting complete for loan ${loanId}. Status: ${status}. Approval ratio: ${(approvalRatio * 100).toFixed(2)}%. Transferred ${ethAmount.toFixed(6)} ETH ($${loan.amount.toFixed(2)} USD) to ${loan.walletAddress}. Transaction hash: ${txHash}`;
+
+			try {
+				// transfer the funds
+				const ethPriceInUSD = await getEthPriceToday();
+				// Convert USD amount to ETH using Decimal for precision
+				const ethAmount = new Decimal(loan.amount).dividedBy(new Decimal(ethPriceInUSD));
+				console.log("Transfer amount in ETH:", ethAmount.toString());
+				const txHash = await transferMoney(loan.walletAddress, ethAmount);
+
+				if (!txHash) {
+					// Revert loan status if transfer fails
+					retryCount = 0;
+					while (retryCount < maxRetries) {
+						try {
+							loan.status = "pending";
+							await db.put(loan);
+							break;
+						} catch (error) {
+							if (error.name === "conflict") {
+								loan = (await db.get(currentLoanId)) as Loan;
+								loan.status = "pending";
+								retryCount++;
+								if (retryCount === maxRetries) {
+									return "Failed to revert loan status after transfer failure. Please contact support.";
+								}
+							} else {
+								throw error;
+							}
+						}
+					}
+					return `Loan ${loanId} has reached approval threshold (${(approvalRatio * 100).toFixed(2)}%). However, the fund transfer failed. Please try again.`;
+				}
+
+				return `Loan ${loanId} has been approved and funded. Approval ratio: ${(approvalRatio * 100).toFixed(2)}%. Transferred ${ethAmount.toString()} ETH ($${loan.amount.toFixed(2)} USD) to ${
+					loan.walletAddress
+				}. Transaction hash: ${txHash}`;
+			} catch (error) {
+				console.log("error97", error);
+				// Revert loan status if transfer fails
+				retryCount = 0;
+				while (retryCount < maxRetries) {
+					try {
+						loan.status = "pending";
+						await db.put(loan);
+						break;
+					} catch (error) {
+						console.log("error44", error);
+						if (error.name === "conflict") {
+							loan = (await db.get(currentLoanId)) as Loan;
+							loan.status = "pending";
+							retryCount++;
+							if (retryCount === maxRetries) {
+								return "Failed to revert loan status after transfer failure. Please contact support.";
+							}
+						} else {
+							throw error;
+						}
+					}
+				}
+				return `Loan ${loanId} has reached approval threshold (${(approvalRatio * 100).toFixed(2)}%). However, the fund transfer failed: ${error.message}. Please try again.`;
+			}
 		}
 
-		return `Vote (${vote ? "approve" : "reject"}) recorded on loan ${loanId}.`;
+		return `Vote (${vote ? "approve" : "reject"}) recorded on loan ${loanId}. Current approval ratio: ${(approvalRatio * 100).toFixed(2)}%.`;
 	},
 	{
 		name: "votingTool",
-		description: "Casts a vote on a loan request, weighted by contributions in the Chama pool.",
+		description: "Casts a vote on a loan request, weighted by contributions in the Chama pool. Requires at least 60% of total pool value in approving votes to pass.",
 		schema: z.object({
 			loanId: z.string().describe("ID of the loan to vote on"),
 			vote: z.boolean().describe("Vote: true to approve, false to reject"),
@@ -429,24 +658,15 @@ export const askHumanTool = tool(
 export const checkContributionBalanceTool = tool(
 	async ({}, config: RunnableConfig) => {
 		const walletAddress = config["configurable"]["walletAddress"];
-		console.log("config", config);
 		if (!walletAddress) {
 			return "Wallet address missing in configuration.";
 		}
 
-		const contribId = `contrib_${walletAddress}`;
-		const contrib = (await db.get(contribId).catch(
-			() =>
-				({
-					_id: contribId,
-					type: "contribution",
-					walletAddress,
-					amountInWei: "0",
-					amountInEth: 0,
-					amountInUsd: 0,
-					amount: 0,
-				} as IContribution)
-		)) as IContribution;
+		// Get all documents and filter for contributions from this wallet
+		const allDocs = await db.allDocs({ include_docs: true });
+		const contributions = allDocs.rows.filter((row) => row.doc?.type === "contribution" && (row.doc as IContribution).walletAddress === walletAddress).map((row) => row.doc as IContribution);
+
+		const totalContribution = contributions.reduce((sum, contrib) => sum + (contrib.amountInUsd || 0), 0);
 
 		const groupDoc = (await db.get("chama").catch(
 			() =>
@@ -458,11 +678,11 @@ export const checkContributionBalanceTool = tool(
 				} as IGroup)
 		)) as IGroup;
 
-		if (contrib.amountInUsd === 0 && contrib._rev === undefined) {
+		if (totalContribution === 0 && contributions.length === 0) {
 			return `No contribution record. Deposit funds to join with 'deposit 10'.`;
 		}
 
-		return `Balance:\n- Contribution: ${contrib.amountInUsd}\n- Total Chama Pool: ${groupDoc.totalPool}.`;
+		return `Balance:\n- Contribution: ${totalContribution}\n- Total Chama Pool: ${groupDoc.totalPool}.`;
 	},
 	{
 		name: "checkContributionBalanceTool",
@@ -511,26 +731,18 @@ export const checkLoanEligibilityTool = tool(
 			return "Wallet address missing in configuration.";
 		}
 
-		const contribId = `contrib_${walletAddress}`;
-		const contrib = (await db.get(contribId).catch(
-			() =>
-				({
-					_id: contribId,
-					type: "contribution",
-					walletAddress,
-					amountInWei: "0",
-					amountInEth: 0,
-					amountInUsd: 0,
-					amount: 0,
-				} as IContribution)
-		)) as IContribution;
+		// Get all documents and filter for contributions from this wallet
+		const allDocs = await db.allDocs({ include_docs: true });
+		const contributions = allDocs.rows.filter((row) => row.doc?.type === "contribution" && (row.doc as IContribution).walletAddress === walletAddress).map((row) => row.doc as IContribution);
 
-		if (contrib.amountInUsd === 0 && contrib._rev === undefined) {
+		if (contributions.length === 0) {
 			return `No contribution record. Deposit funds to become eligible for loans with 'deposit 10'.`;
 		}
 
-		const maxLoan = contrib.amountInUsd * 5;
-		return `Eligible for a loan up to ${maxLoan} based on contribution of ${contrib.amountInUsd}.`;
+		// Sum up all contributions
+		const totalContribution = contributions.reduce((sum, contrib) => sum + (contrib.amountInUsd || 0), 0);
+		const maxLoan = totalContribution * 5;
+		return `Eligible for a loan up to ${maxLoan} based on total contribution of ${totalContribution}.`;
 	},
 	{
 		name: "checkLoanEligibilityTool",
@@ -607,6 +819,7 @@ export const checkGroupStatusTool = tool(
 		schema: z.object({}),
 	}
 );
+
 export const checkWalletAddressTool = tool(
 	async ({}, config: RunnableConfig) => {
 		const walletAddress = config["configurable"]["walletAddress"];

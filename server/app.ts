@@ -1,7 +1,7 @@
 import { Address, Coinbase, Wallet } from "@coinbase/coinbase-sdk";
 import { CDP_API_KEY, CDP_API_KEY_PRIVATE_KEY, ENCRYPTION_KEY, NETWORK_ID, OPENAI_API_KEY, WALLET_KEY, XMTP_ENV } from "./constants";
 import { createSigner, getEncryptionKeyFromHex, logAgentDetails } from "@helpers/client";
-import { Client, Conversation, DecodedMessage, XmtpEnv } from "@xmtp/node-sdk";
+import { Client, ConsentState, Conversation, ConversationType, DecodedMessage, Group, Identifier, IdentifierKind, XmtpEnv } from "@xmtp/node-sdk";
 import { ChatOpenAI } from "@langchain/openai";
 import { AgentKit, AgentKitOptions, CdpWalletProvider, erc20ActionProvider, walletActionProvider } from "@coinbase/agentkit";
 import { getLangChainTools } from "@coinbase/agentkit-langchain";
@@ -18,6 +18,7 @@ import {
 	groupSavingsTool,
 	investmentTool,
 	lendingTool,
+	verifyGroupSavingTransactionHash,
 	votingTool,
 } from "tools";
 import { convertToOpenAITool } from "@langchain/core/utils/function_calling";
@@ -55,6 +56,7 @@ const chamaTools = [
 	checkGroupStatusTool,
 	checkLoanEligibilityTool,
 	checkContributionBalanceTool,
+	verifyGroupSavingTransactionHash
 ];
 
 async function createAgent({ llm, tools, systemMessage }: { llm: ChatOpenAI; tools: StructuredTool[]; systemMessage: string }) {
@@ -117,7 +119,32 @@ async function initXMTPClient() {
 	console.log("✓ Syncing conversations...");
 	await client.conversations.sync();
 
-	return client;
+	const groupMembers: Identifier[] = [
+		{
+			identifier: "0x5413eb0c19d3a7ca4876c02036c6decc390f3687",
+			identifierKind: IdentifierKind.Ethereum,
+		},
+		{
+			identifier: "0x1758ba28a5d95b217fa9723e9a1198f0a18a4cf5",
+			identifierKind: IdentifierKind.Ethereum,
+		},
+	];
+
+	// check if group exists
+	const existingGroups = client.conversations.listGroups();
+
+	const alreadyGroup = existingGroups.find((item) => item.name === "Nova Labs");
+
+	let group;
+
+	if (alreadyGroup) {
+		group = alreadyGroup;
+	} else {
+		// create a group,
+		group = await client.conversations.newGroupWithIdentifiers(groupMembers, { groupName: "Nova Labs", groupDescription: "Test Labs for XMTP with Coinbase AI" });
+	}
+
+	return { client, group };
 }
 
 async function runAgentNode(props: { state: typeof MessagesAnnotation.State; agent: Runnable; name: string; config?: RunnableConfig }) {
@@ -141,7 +168,7 @@ async function getWalletTransactions(walletAddress: string) {
 	console.log("transactions", transactions.data);
 }
 
-async function initAgent(userId: string, wallet: string) {
+async function initAgent(conversationId: string, wallet: string) {
 	try {
 		const llm = new ChatOpenAI({
 			model: "gpt-4o",
@@ -154,7 +181,7 @@ async function initAgent(userId: string, wallet: string) {
 		});
 
 		// pool information
-		getWalletTransactions("0x5413eb0c19d3a7ca4876c02036c6decc390f3687");
+		// getWalletTransactions("0x5413eb0c19d3a7ca4876c02036c6decc390f3687");
 
 		const walletProvider = await CdpWalletProvider.configureWithWallet({
 			apiKeyId: CDP_API_KEY,
@@ -177,10 +204,10 @@ async function initAgent(userId: string, wallet: string) {
 
 		const tools = await getLangChainTools(agentKit);
 
-		memoryStore[userId] = new MemorySaver();
+		memoryStore[conversationId] = new MemorySaver();
 
 		const agentConfig: AgentConfig = {
-			configurable: { thread_id: userId, walletAddress: wallet },
+			configurable: { thread_id: conversationId, walletAddress: wallet },
 		};
 
 		const allTools = [...chamaTools, ...tools];
@@ -218,7 +245,7 @@ async function initAgent(userId: string, wallet: string) {
 			.addEdge("askHuman", "agent")
 			.addConditionalEdges("agent", shouldContinue);
 
-		const app = workflow.compile({ checkpointer: memoryStore[userId] });
+		const app = workflow.compile({ checkpointer: memoryStore[conversationId] });
 
 		return { agent: app, config: agentConfig };
 	} catch (error) {
@@ -234,6 +261,8 @@ async function processMessage(agent: Agent, config: AgentConfig, message: string
 		for await (const event of stream) {
 			if (!event.__end__) {
 				const node = Object.keys(event)[0];
+				// console.log('node', node)
+				// console.log('event', event)
 				const recentMsg = event[node].messages[event[node].messages.length - 1] as BaseMessage;
 				response += String(recentMsg.content) + "\n";
 			}
@@ -245,7 +274,7 @@ async function processMessage(agent: Agent, config: AgentConfig, message: string
 	}
 }
 
-async function handleMessage(message: DecodedMessage, client: Client) {
+async function handleMessage(message: DecodedMessage, client: Client, group: any) {
 	let conversation: Conversation | null = null;
 	try {
 		const senderAddress = message.senderInboxId.toLowerCase();
@@ -256,21 +285,18 @@ async function handleMessage(message: DecodedMessage, client: Client) {
 
 		const members = await convo.members();
 
-		
-
 		// console.log("members[0].inboxId", members[0].inboxId);
 
 		// console.log("members", members[0].accountIdentifiers[0].identifier);
 
-		console.log("message", message);
+		// console.log("message", message);
 		if (senderAddress === botAddress) {
 			return; // Ignore self-messages
 		}
 
-		const senderDetails = members.find((member) => member.inboxId === senderAddress)
+		const senderDetails = members.find((member) => member.inboxId === senderAddress);
 
-		const walletAddress = senderDetails.accountIdentifiers[0].identifier
-
+		const walletAddress = senderDetails.accountIdentifiers[0].identifier;
 
 		console.log(`Received message from ${senderAddress}: ${message.content}`);
 
@@ -278,7 +304,7 @@ async function handleMessage(message: DecodedMessage, client: Client) {
 		let agentData = agentStore[senderAddress];
 		if (!agentData) {
 			// Initialize agent only if it doesn't exist
-			agentData = await initAgent(senderAddress, walletAddress);
+			agentData = await initAgent(message.conversationId, walletAddress);
 			agentStore[senderAddress] = agentData;
 		}
 		const { agent, config } = agentData;
@@ -327,6 +353,7 @@ async function handleMessage(message: DecodedMessage, client: Client) {
 			throw new Error(`Could not find conversation for ID: ${message.conversationId}`);
 		}
 		await conversation.send(response.trim());
+		// await group.send(response.trim());
 		console.log(`Sent response to ${senderAddress}: ${response.trim()}`);
 	} catch (error) {
 		console.error("Error handling message:", error);
@@ -336,12 +363,12 @@ async function handleMessage(message: DecodedMessage, client: Client) {
 	}
 }
 
-async function startMessageListener(client: Client) {
+async function startMessageListener(client: Client, group: any) {
 	console.log("Starting XMTP message listener...");
-	const stream = await client.conversations.streamAllMessages();
+	const stream = await client.conversations.streamAllMessages((err, val) => {}, ConversationType.Group, [ConsentState.Allowed]);
 	for await (const message of stream) {
 		if (message) {
-			await handleMessage(message, client);
+			await handleMessage(message, client, group);
 		}
 	}
 }
@@ -350,8 +377,8 @@ async function main(): Promise<void> {
 	console.log("Initializing Chama DeFi Bot on XMTP...");
 	ensureLocalStorage();
 	try {
-		const xmtpClient = await initXMTPClient();
-		await startMessageListener(xmtpClient);
+		const { client: xmtpClient, group } = await initXMTPClient();
+		await startMessageListener(xmtpClient, group);
 	} catch (error) {
 		console.log(error);
 		console.error("Failed to start bot:", error);
