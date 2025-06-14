@@ -116,15 +116,22 @@ For the server (in `server` directory):
 cp .env.example .env
 ```
 Edit `.env` with your configuration:
-- `ETHEREUM_RPC_URL`: Your Ethereum RPC URL
-- `WALLET_PRIVATE_KEY`: Your wallet private key
-- `XMTP_API_KEY`: Your XMTP API key
+- `NETWORK_ID`: Your network ID
+- `OPENAI_API_KEY`: Your OpenAI API key
+- `CDP_API_KEY_NAME`: Your CDP API key name
+- `CDP_API_KEY`: Your CDP API key
+- `CDP_API_KEY_PRIVATE_KEY`: Your CDP API private key
+- `XMTP_ENV`: XMTP environment (default: dev)
+- `WALLET_KEY`: Your wallet key
+- `ENCRYPTION_KEY`: Your encryption key
+- `CDP_WALLET_SECRET`: Your CDP wallet secret
+- `WALLET_MNEMONIC_PHRASE`: Your wallet mnemonic phrase
+- `TELEGRAM_BOT_TOKEN`: Your Telegram bot token
+- `COINGECKO_API_KEY`: Your CoinGecko API key
 
 For the client (in `client` directory):
-```bash
-cp .env.example .env
-```
-Edit `.env` with your configuration:
+
+Create a `.env` with your configuration:
 - `NEXT_PUBLIC_ONCHAINKIT_API_KEY`: Your Onchainkit API Key from Coinbase developer portal.
 
 5. Start the development servers:
