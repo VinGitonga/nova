@@ -55,6 +55,11 @@ Nova is a decentralized AI agent that revolutionizes traditional group finance (
 [![Screenshot-2025-06-14-at-00-30-35.png](https://i.postimg.cc/RVZr6DrL/Screenshot-2025-06-14-at-00-30-35.png)](https://postimg.cc/Sj31HVxn)
 
 
+## Architecture 
+
+[![Frame-1116607522.png](https://i.postimg.cc/MHBLfDh0/Frame-1116607522.png)](https://postimg.cc/SYydwWQj)
+
+
 ## Proof of Deployment
 https://base-sepolia.blockscout.com/tx/0x538dfa8a3923eaedf39c7a208c50a90440d1734ab62e1cc3965a522c0e4a0250
 
@@ -81,4 +86,60 @@ https://base-sepolia.blockscout.com/tx/0x538dfa8a3923eaedf39c7a208c50a90440d1734
 - Ethereum wallet (e.g., MetaMask, Coinbase)
 - ETH for gas fees
 - XMTP-enabled messaging client
+- Node JS
+- Bun
 
+### Local Setup
+
+1. Clone the repository:
+```bash
+git clone https://github.com/yourusername/nova.git
+cd nova
+```
+
+2. Set up the server:
+```bash
+cd server
+yarn install
+```
+
+3. Set up the client:
+```bash
+cd ../client
+yarn install
+```
+
+4. Configure environment variables:
+
+For the server (in `server` directory):
+```bash
+cp .env.example .env
+```
+Edit `.env` with your configuration:
+- `ETHEREUM_RPC_URL`: Your Ethereum RPC URL
+- `WALLET_PRIVATE_KEY`: Your wallet private key
+- `XMTP_API_KEY`: Your XMTP API key
+
+For the client (in `client` directory):
+```bash
+cp .env.example .env
+```
+Edit `.env` with your configuration:
+- `NEXT_PUBLIC_ONCHAINKIT_API_KEY`: Your Onchainkit API Key from Coinbase developer portal.
+
+5. Start the development servers:
+
+In one terminal (server):
+```bash
+cd server
+bun --watch app.ts
+```
+
+In another terminal (client):
+```bash
+cd client
+yarn dev
+```
+
+6. Access the application:
+- Frontend: http://localhost:3000
