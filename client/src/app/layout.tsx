@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
-// import "@coinbase/onchainkit/styles.css";
 import "./globals.css";
+import "@coinbase/onchainkit/styles.css";
 import { jakartaSans } from "@/lib/font";
 import AppProvider from "@/providers/AppProvider";
 

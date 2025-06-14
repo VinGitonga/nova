@@ -7,6 +7,8 @@ import { RxArrowTopRight } from "react-icons/rx";
 import { ReactNode } from "react";
 import { CiGlobe } from "react-icons/ci";
 import HomeConnectBtn from "@/components/btn/home-connect-btn";
+import ConnectWalletBtn from "@/components/btn/connect-wallet";
+import WalletConnections from "@/components/wallet-connections/WalletConnections";
 
 interface HomeLinkProps {
 	isActive?: boolean;
@@ -36,9 +38,8 @@ const page = () => {
 					<HomeLink href="/" isActive text="Home" />
 					<HomeLink href="/" text="Features" />
 					<HomeLink href="/" text="How It Works" />
-					<HomeLink href="/" text="About" />
 					<div className="ml-5">
-						<HomeConnectBtn />
+						<WalletConnections />
 					</div>
 				</div>
 			</div>
@@ -52,7 +53,7 @@ const page = () => {
 						<p className="text-lg">Modernize group finance with Nova's decentralized platform. Pool funds, vote fairly, and grow wealth as a community</p>
 					</div>
 					<div className="mt-5">
-						<HomeConnectBtn text="Chat" />
+						<WalletConnections />
 					</div>
 				</div>
 				<div className="col-auto md:col-span-4">
